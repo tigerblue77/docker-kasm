@@ -1,12 +1,52 @@
 #!/usr/bin/with-contenv bash
 # shellcheck shell=bash
 
+KASM_SESSIONS_STATE="/opt/kasm_sessions.state"
+
 while [[ ! -S /var/run/docker.sock ]]; do
   sleep 1
 done
 
-# Stop any running containers that shouldn't be
-docker ps -q | xargs docker stop &> /dev/null
+# Stop any running containers that shouldn't be, so that /opt/kasm/bin/start
+# brings the Kasm services up in dependency order. Workspace sessions and their
+# helpers are left alone: Kasm still has them in the state they were in before
+# the restart, and they are restored below.
+docker ps --format '{{.ID}} {{.Label "kasm.kasmid"}}{{.Label "kasm.helper.kasmid"}}' | awk '$2 == "" {print $1}' | xargs -r docker stop &> /dev/null
+
+# Restore the sessions recorded by the finish script before the Kasm services
+# start, so that none of the services can be handed one of their addresses.
+# Kasm routes to a session by the address it was created with, whereas Docker
+# gives a starting container the lowest free address rather than its previous
+# one, so each session is pinned back to the address it had.
+if [[ -f "${KASM_SESSIONS_STATE}" ]]; then
+    # Release every recorded address first, in case dockerd already restarted
+    # some of these containers after an unclean shutdown
+    cut -d ' ' -f 1 "${KASM_SESSIONS_STATE}" | xargs -r docker stop &> /dev/null
+    while read -r id status networks <&3; do
+        docker inspect "${id}" &> /dev/null || continue
+        echo "Restoring Kasm session container ${id:0:12} (${status})"
+        pinned=true
+        for network in ${networks}; do
+            address="${network#*=}"
+            network="${network%%=*}"
+            [[ -n "${address}" ]] || continue
+            docker network disconnect --force "${network}" "${id}" &> /dev/null
+            if ! docker network connect --ip "${address}" "${network}" "${id}"; then
+                docker network connect "${network}" "${id}"
+                pinned=false
+            fi
+        done
+        if [[ "${pinned}" != "true" ]]; then
+            echo "Could not give ${id:0:12} its previous address back, leaving it stopped"
+            continue
+        fi
+        docker start "${id}" > /dev/null
+        if [[ "${status}" == "paused" ]]; then
+            docker pause "${id}" > /dev/null
+        fi
+    done 3< "${KASM_SESSIONS_STATE}"
+    rm -f "${KASM_SESSIONS_STATE}"
+fi
 
 if [[ -f /opt/kasm/bin/start ]]; then
   /opt/kasm/bin/start
